@@ -26,18 +26,12 @@ This CLI bridges the gap natively:
    git clone https://github.com/sayoojd/video_courses_from_rclone_repos.git
    cd video_courses_from_rclone_repos
    ```
-2. Make the script executable:
+2. Run the automated installer:
    ```bash
-   chmod +x courses
+   chmod +x install.sh
+   ./install.sh
    ```
-3. Move or symlink the script to your PATH:
-   ```bash
-   mkdir -p ~/.courses-cli/bin
-   cp courses ~/.courses-cli/bin/
-   
-   # Add this to your ~/.zshrc or ~/.bashrc:
-   export PATH="$HOME/.courses-cli/bin:$PATH"
-   ```
+   *(The installer will automatically verify your dependencies and place the `courses` command in your local binary path).*
 
 ## Usage
 
