@@ -232,10 +232,12 @@ def play_file(stdscr, filepath, course_name, config):
             siblings.sort(key=natural_sort_key)
             if base_name in siblings:
                 start_idx = siblings.index(base_name)
-                playlist_files = siblings[start_idx:]
+                playlist_files = siblings
             else:
+                start_idx = 0
                 playlist_files = [base_name]
         except Exception:
+            start_idx = 0
             playlist_files = [base_name]
             
         last_played_filepath = filepath
@@ -268,7 +270,7 @@ def play_file(stdscr, filepath, course_name, config):
                     time.sleep(0.1)
             
             print("Opening in mpv player (with playlist auto-play enabled)...")
-            cmd = ["mpv", "--save-position-on-quit", "--hwdec=no", "--force-seekable=yes", "--prefetch-playlist=yes"] + stream_urls
+            cmd = ["mpv", "--save-position-on-quit", "--hwdec=no", "--force-seekable=yes", "--prefetch-playlist=yes", f"--playlist-start={start_idx}"] + stream_urls
             result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             
             server_proc.terminate()
@@ -286,7 +288,7 @@ def play_file(stdscr, filepath, course_name, config):
         else:
             print("Opening in mpv player (with playlist auto-play enabled)...")
             local_paths = [fs_join(dir_name, f) for f in playlist_files]
-            cmd = ["mpv", "--save-position-on-quit", "--hwdec=no", "--force-seekable=yes", "--prefetch-playlist=yes"] + local_paths
+            cmd = ["mpv", "--save-position-on-quit", "--hwdec=no", "--force-seekable=yes", "--prefetch-playlist=yes", f"--playlist-start={start_idx}"] + local_paths
             result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             
             lines = result.stdout.splitlines()
