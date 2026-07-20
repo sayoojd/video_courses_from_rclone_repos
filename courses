@@ -256,7 +256,17 @@ def play_file(stdscr, filepath, course_name, config):
         
         if is_rclone_path(filepath):
             print(f"Spawning temporary rclone HTTP stream for {len(playlist_files)} videos...")
-            base_path = next(c["path"] for c in config["courses"] if c["name"] == course_name)
+            
+            def get_base_path(courses_list):
+                for c in courses_list:
+                    if c.get("type") == "folder":
+                        res = get_base_path(c.get("courses", []))
+                        if res: return res
+                    elif c["name"] == course_name:
+                        return c["path"]
+                return None
+                
+            base_path = get_base_path(config["courses"])
             port = get_course_port(base_path)
             
             stream_urls = []
