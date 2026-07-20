@@ -217,6 +217,18 @@ def select_menu(stdscr, title, options, extra_info=None):
         elif key in [27, ord('q'), ord('Q'), curses.KEY_BACKSPACE, 127, 8]:
             return '__back__'
 
+def update_course_last_played(config, course_name, last_played_data):
+    def _update(courses_list):
+        for course in courses_list:
+            if course.get("type") == "folder":
+                if _update(course.get("courses", [])): return True
+            elif course["name"] == course_name:
+                course["last_played"] = last_played_data
+                return True
+        return False
+    _update(config["courses"])
+    save_config(config)
+
 def play_file(stdscr, filepath, course_name, config):
     curses.endwin()
     base_name = fs_basename(filepath)
@@ -299,15 +311,11 @@ def play_file(stdscr, filepath, course_name, config):
                     break
                     
         # Save last played
-        for course in config["courses"]:
-            if course["name"] == course_name:
-                course["last_played"] = {
-                    "file_path": last_played_filepath,
-                    "file_name": fs_basename(last_played_filepath),
-                    "timestamp": time.time()
-                }
-                break
-        save_config(config)
+        update_course_last_played(config, course_name, {
+            "file_path": last_played_filepath,
+            "file_name": fs_basename(last_played_filepath),
+            "timestamp": time.time()
+        })
     else:
         if is_rclone_path(filepath):
             print("Fetching document from cloud...")
@@ -318,15 +326,11 @@ def play_file(stdscr, filepath, course_name, config):
             print("Opening document in default viewer...")
             subprocess.run(["open", filepath])
             
-        for course in config["courses"]:
-            if course["name"] == course_name:
-                course["last_played"] = {
-                    "file_path": filepath,
-                    "file_name": base_name,
-                    "timestamp": time.time()
-                }
-                break
-        save_config(config)
+        update_course_last_played(config, course_name, {
+            "file_path": filepath,
+            "file_name": base_name,
+            "timestamp": time.time()
+        })
         
     time.sleep(1.5)
     stdscr.clear()
@@ -452,7 +456,16 @@ def handle_course_options(stdscr, course, config):
         stdscr.addstr(2, 2, f"Loading course data... Please wait.", curses.color_pair(3))
         stdscr.refresh()
         
-        fresh_course = next((c for c in config["courses"] if c["name"] == course_name), None)
+        def find_course(courses_list):
+            for c in courses_list:
+                if c.get("type") == "folder":
+                    res = find_course(c.get("courses", []))
+                    if res: return res
+                elif c["name"] == course_name:
+                    return c
+            return None
+            
+        fresh_course = find_course(config["courses"])
         if not fresh_course:
             return
             
@@ -488,6 +501,25 @@ def handle_course_options(stdscr, course, config):
             elif action_type == "browse":
                 browse_folders(stdscr, base_path, path, course_name, config)
 
+def handle_folder_options(stdscr, folder, config):
+    folder_name = folder["name"]
+    while True:
+        stdscr.clear()
+        
+        options = []
+        for course in folder.get("courses", []):
+            options.append((f"▸ {course['name']}", ("course", course)))
+            
+        options.append(("↩ Back to Main Menu", "__back__"))
+        
+        choice = select_menu(stdscr, f"Folder: {folder_name}", options)
+        
+        if choice == '__back__':
+            return
+        elif choice:
+            _, course = choice
+            handle_course_options(stdscr, course, config)
+
 def main(stdscr):
     curses.start_color()
     curses.use_default_colors()
@@ -503,9 +535,32 @@ def main(stdscr):
     while True:
         config = load_config()
         
+        # Calculate Global Resume
+        latest_course = None
+        max_ts = 0
+        def check_course(c):
+            nonlocal latest_course, max_ts
+            lp = c.get("last_played")
+            if lp and lp.get("timestamp", 0) > max_ts:
+                max_ts = lp["timestamp"]
+                latest_course = c
+                
+        for item in config["courses"]:
+            if item.get("type") == "folder":
+                for c in item.get("courses", []): check_course(c)
+            else:
+                check_course(item)
+        
         options = []
-        for course in config["courses"]:
-            options.append((course["name"], ("course", course)))
+        if latest_course:
+            lp_name = latest_course["last_played"]["file_name"]
+            options.append((f"▶ Resume: {lp_name}", ("resume", latest_course)))
+            
+        for item in config["courses"]:
+            if item.get("type") == "folder":
+                options.append((f"📁 {item['name']}", ("folder", item)))
+            else:
+                options.append((f"▸ {item['name']}", ("course", item)))
             
         options.append(("[+] Add a New Course", ("action", "add")))
         options.append(("[x] Exit", ("action", "exit")))
@@ -517,8 +572,13 @@ def main(stdscr):
         elif choice == ('action', 'add'):
             add_course_screen(stdscr, config)
         elif choice:
-            _, course = choice
-            handle_course_options(stdscr, course, config)
+            type_, item = choice
+            if type_ == "folder":
+                handle_folder_options(stdscr, item, config)
+            elif type_ == "course":
+                handle_course_options(stdscr, item, config)
+            elif type_ == "resume":
+                play_file(stdscr, item["last_played"]["file_path"], item["name"], config)
 
 if __name__ == "__main__":
     try:
