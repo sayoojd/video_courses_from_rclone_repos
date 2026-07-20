@@ -43,7 +43,10 @@ def load_config():
     try:
         with open(CONFIG_PATH, 'r') as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        import shutil
+        if os.path.exists(CONFIG_PATH):
+            shutil.copy(CONFIG_PATH, CONFIG_PATH + ".bak")
         return {"courses": []}
 
 def save_config(config):
@@ -70,7 +73,7 @@ def fs_dirname(path):
     if is_rclone_path(path):
         if '/' in path:
             return path.rsplit('/', 1)[0]
-        return path # root
+        return path.split(':', 1)[0] + ':'
     return os.path.dirname(path)
 
 def fs_basename(path):
@@ -144,9 +147,10 @@ def get_next_files(current_file_path):
         pass
     return {}
 
-def get_course_port(base_path):
-    val = int(hashlib.md5(base_path.encode()).hexdigest()[:8], 16)
-    return 40000 + (val % 20000)
+def get_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
 
 def draw_menu(stdscr, title, options, selected_idx, extra_info=None):
     stdscr.clear()
@@ -267,7 +271,12 @@ def play_file(stdscr, filepath, course_name, config):
                 return None
                 
             base_path = get_base_path(config["courses"])
-            port = get_course_port(base_path)
+            if not base_path:
+                print(f"\nError: Could not resolve base path for course '{course_name}'")
+                time.sleep(2)
+                return
+                
+            port = get_free_port()
             
             stream_urls = []
             for f in playlist_files:
@@ -284,6 +293,10 @@ def play_file(stdscr, filepath, course_name, config):
             
             # Actively poll the HTTP endpoint to wait for rclone VFS cache to be fully ready
             for _ in range(50):
+                if server_proc.poll() is not None:
+                    print("\nError: rclone server crashed unexpectedly!")
+                    time.sleep(2)
+                    return
                 try:
                     resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=0.2)
                     if resp.status == 200:
