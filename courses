@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import re
+import subprocess
+import time
+import curses
+import urllib.parse
+import urllib.request
+import hashlib
+import socket
+
+CONFIG_PATH = os.path.expanduser("~/.courses-cli/config.json")
+CACHE_PATH = os.path.expanduser("~/.courses-cli/fs_cache.json")
+PLAYABLE_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.mp3', '.m4a', '.wav', '.pdf', '.txt', '.html'}
+MEDIA_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.mp3', '.m4a', '.wav'}
+
+def load_fs_cache():
+    if os.path.exists(CACHE_PATH):
+        try:
+            with open(CACHE_PATH, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+_FS_CACHE = load_fs_cache()
+
+def save_fs_cache():
+    try:
+        with open(CACHE_PATH, 'w') as f:
+            json.dump(_FS_CACHE, f)
+    except:
+        pass
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        default_config = {"courses": []}
+        save_config(default_config)
+        return default_config
+    try:
+        with open(CONFIG_PATH, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {"courses": []}
+
+def save_config(config):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(config, f, indent=2)
+
+def is_playable(filename):
+    _, ext = os.path.splitext(filename.lower())
+    return ext in PLAYABLE_EXTENSIONS
+
+def natural_sort_key(s):
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
+
+def is_rclone_path(path):
+    return ':' in path and not path.startswith('/')
+
+def fs_join(base, name):
+    if is_rclone_path(base):
+        return f"{base}/{name}" if not base.endswith(':') else f"{base}{name}"
+    return os.path.join(base, name)
+
+def fs_dirname(path):
+    if is_rclone_path(path):
+        if '/' in path:
+            return path.rsplit('/', 1)[0]
+        return path # root
+    return os.path.dirname(path)
+
+def fs_basename(path):
+    if is_rclone_path(path):
+        return path.split('/')[-1] if '/' in path else path.split(':', 1)[1]
+    return os.path.basename(path)
+
+def fs_listdir(path, force_refresh=False):
+    if not force_refresh and path in _FS_CACHE:
+        return _FS_CACHE[path][0], _FS_CACHE[path][1]
+        
+    if is_rclone_path(path):
+        try:
+            result = subprocess.run(["rclone", "lsjson", path], capture_output=True, text=True)
+            if result.returncode != 0:
+                raise Exception(result.stderr)
+            items = json.loads(result.stdout)
+            dirs = [i["Name"] for i in items if i["IsDir"]]
+            files = [i["Name"] for i in items if not i["IsDir"]]
+            _FS_CACHE[path] = [dirs, files]
+            save_fs_cache()
+            return dirs, files
+        except Exception as e:
+            if path in _FS_CACHE:
+                return _FS_CACHE[path][0], _FS_CACHE[path][1]
+            raise Exception(f"Rclone API Error: {e}")
+    else:
+        items = os.listdir(path)
+        dirs = []
+        files = []
+        for item in items:
+            if item.startswith('.'):
+                continue
+            full_path = os.path.join(path, item)
+            if os.path.isdir(full_path):
+                dirs.append(item)
+            elif os.path.isfile(full_path):
+                files.append(item)
+        return dirs, files
+
+def get_next_files(current_file_path):
+    if not current_file_path: return {}
+    
+    dir_name = fs_dirname(current_file_path)
+    file_name = fs_basename(current_file_path)
+    
+    if not is_rclone_path(current_file_path):
+        if not os.path.exists(current_file_path): return {}
+        
+    try:
+        _, files = fs_listdir(dir_name)
+        siblings = [f for f in files if is_playable(f)]
+        siblings.sort(key=natural_sort_key)
+        if file_name in siblings:
+            idx = siblings.index(file_name)
+            
+            next_video = None
+            for f in siblings[idx + 1:]:
+                if os.path.splitext(f.lower())[1] in MEDIA_EXTENSIONS:
+                    next_video = fs_join(dir_name, f)
+                    break
+                    
+            next_doc = None
+            for f in siblings[idx + 1:]:
+                if os.path.splitext(f.lower())[1] not in MEDIA_EXTENSIONS:
+                    next_doc = fs_join(dir_name, f)
+                    break
+                    
+            return {"video": next_video, "doc": next_doc}
+    except Exception:
+        pass
+    return {}
+
+def get_course_port(base_path):
+    val = int(hashlib.md5(base_path.encode()).hexdigest()[:8], 16)
+    return 40000 + (val % 20000)
+
+def draw_menu(stdscr, title, options, selected_idx, extra_info=None):
+    stdscr.clear()
+    h, w = stdscr.getmaxyx()
+    
+    def safe_addstr(y, x, text, attr=0):
+        try:
+            stdscr.addstr(y, x, text[:max(0, w - x - 1)], attr)
+        except curses.error:
+            pass
+
+    c_title = curses.color_pair(1) | curses.A_BOLD
+    c_normal = curses.color_pair(0)
+    c_selected = curses.color_pair(5) | curses.A_BOLD
+    c_dim = curses.color_pair(6)
+    
+    title_str = f"=== {title} ==="
+    safe_addstr(1, max(2, (w - len(title_str)) // 2), title_str, c_title)
+    
+    row = 3
+    if extra_info:
+        for info in extra_info:
+            safe_addstr(row, 2, info, c_dim)
+            row += 1
+        row += 1
+        
+    max_visible = max(5, h - row - 3)
+    start_idx = max(0, selected_idx - max_visible // 2)
+    end_idx = min(len(options), start_idx + max_visible)
+    
+    if end_idx - start_idx < max_visible:
+        start_idx = max(0, end_idx - max_visible)
+        
+    if start_idx > 0:
+        safe_addstr(row, 2, "▲ ... (more above)", c_dim)
+    row += 1
+    
+    for i in range(start_idx, end_idx):
+        opt_label, _ = options[i]
+        if i == selected_idx:
+            safe_addstr(row, 2, f"▸ {opt_label}", c_selected)
+        else:
+            safe_addstr(row, 2, f"  {opt_label}", c_normal)
+        row += 1
+        
+    if end_idx < len(options):
+        safe_addstr(row, 2, "▼ ... (more below)", c_dim)
+        
+    footer = "[↑/↓] Navigate  •  [Enter] Select  •  [q/Esc/Backspace] Back"
+    safe_addstr(h-2, max(2, (w - len(footer)) // 2), footer, c_dim)
+    stdscr.refresh()
+
+def select_menu(stdscr, title, options, extra_info=None):
+    selected_idx = 0
+    while True:
+        draw_menu(stdscr, title, options, selected_idx, extra_info)
+        key = stdscr.getch()
+        
+        if key == curses.KEY_UP or key == ord('k'):
+            selected_idx = (selected_idx - 1) % max(1, len(options))
+        elif key == curses.KEY_DOWN or key == ord('j'):
+            selected_idx = (selected_idx + 1) % max(1, len(options))
+        elif key == curses.KEY_LEFT or key == curses.KEY_RIGHT or key == ord('h') or key == ord('l'):
+            pass 
+        elif key in [curses.KEY_ENTER, 10, 13]:
+            if options:
+                return options[selected_idx][1]
+        elif key in [27, ord('q'), ord('Q'), curses.KEY_BACKSPACE, 127, 8]:
+            return '__back__'
+
+def play_file(stdscr, filepath, course_name, config):
+    curses.endwin()
+    base_name = fs_basename(filepath)
+    print(f"\nLaunching: {base_name}")
+    
+    _, ext = os.path.splitext(filepath.lower())
+    
+    if ext in MEDIA_EXTENSIONS:
+        dir_name = fs_dirname(filepath)
+        try:
+            _, files = fs_listdir(dir_name)
+            siblings = [f for f in files if os.path.splitext(f.lower())[1] in MEDIA_EXTENSIONS]
+            siblings.sort(key=natural_sort_key)
+            if base_name in siblings:
+                start_idx = siblings.index(base_name)
+                playlist_files = siblings[start_idx:]
+            else:
+                playlist_files = [base_name]
+        except Exception:
+            playlist_files = [base_name]
+            
+        last_played_filepath = filepath
+        
+        if is_rclone_path(filepath):
+            print(f"Spawning temporary rclone HTTP stream for {len(playlist_files)} videos...")
+            base_path = next(c["path"] for c in config["courses"] if c["name"] == course_name)
+            port = get_course_port(base_path)
+            
+            stream_urls = []
+            for f in playlist_files:
+                f_path = fs_join(dir_name, f)
+                subpath = f_path[len(base_path):]
+                if subpath.startswith('/'): subpath = subpath[1:]
+                encoded_subpath = urllib.parse.quote(subpath, safe='/')
+                stream_urls.append(f"http://127.0.0.1:{port}/{encoded_subpath}")
+            
+            server_proc = subprocess.Popen(
+                ["rclone", "serve", "http", base_path, "--addr", f"127.0.0.1:{port}", "--vfs-cache-mode", "full", "--vfs-read-ahead", "128M"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            
+            # Actively poll the HTTP endpoint to wait for rclone VFS cache to be fully ready
+            for _ in range(50):
+                try:
+                    resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=0.2)
+                    if resp.status == 200:
+                        break
+                except Exception:
+                    time.sleep(0.1)
+            
+            print("Opening in mpv player (with playlist auto-play enabled)...")
+            cmd = ["mpv", "--save-position-on-quit", "--hwdec=no", "--force-seekable=yes", "--prefetch-playlist=yes"] + stream_urls
+            result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            
+            server_proc.terminate()
+            server_proc.wait()
+            
+            lines = result.stdout.splitlines()
+            for line in reversed(lines):
+                if line.startswith("Playing: http"):
+                    url = line.split("Playing: ", 1)[1].strip()
+                    parsed = urllib.parse.urlparse(url)
+                    decoded_subpath = urllib.parse.unquote(parsed.path)
+                    if decoded_subpath.startswith('/'): decoded_subpath = decoded_subpath[1:]
+                    last_played_filepath = fs_join(base_path, decoded_subpath)
+                    break
+        else:
+            print("Opening in mpv player (with playlist auto-play enabled)...")
+            local_paths = [fs_join(dir_name, f) for f in playlist_files]
+            cmd = ["mpv", "--save-position-on-quit", "--hwdec=no", "--force-seekable=yes", "--prefetch-playlist=yes"] + local_paths
+            result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            
+            lines = result.stdout.splitlines()
+            for line in reversed(lines):
+                if line.startswith("Playing: "):
+                    path = line.split("Playing: ", 1)[1].strip()
+                    last_played_filepath = path
+                    break
+                    
+        # Save last played
+        for course in config["courses"]:
+            if course["name"] == course_name:
+                course["last_played"] = {
+                    "file_path": last_played_filepath,
+                    "file_name": fs_basename(last_played_filepath),
+                    "timestamp": time.time()
+                }
+                break
+        save_config(config)
+    else:
+        if is_rclone_path(filepath):
+            print("Fetching document from cloud...")
+            temp_path = f"/tmp/{base_name}"
+            subprocess.run(["rclone", "copyto", filepath, temp_path])
+            subprocess.run(["open", temp_path])
+        else:
+            print("Opening document in default viewer...")
+            subprocess.run(["open", filepath])
+            
+        for course in config["courses"]:
+            if course["name"] == course_name:
+                course["last_played"] = {
+                    "file_path": filepath,
+                    "file_name": base_name,
+                    "timestamp": time.time()
+                }
+                break
+        save_config(config)
+        
+    time.sleep(1.5)
+    stdscr.clear()
+    stdscr.refresh()
+
+def browse_folders(stdscr, base_path, current_path, course_name, config):
+    while True:
+        stdscr.clear()
+        stdscr.addstr(2, 2, f"Loading folder... Please wait.", curses.color_pair(3))
+        stdscr.refresh()
+        
+        try:
+            dirs, files = fs_listdir(current_path)
+        except Exception as e:
+            curses.endwin()
+            print(f"Error reading directory: {e}")
+            input("Press Enter to return...")
+            stdscr.clear()
+            stdscr.refresh()
+            return
+            
+        dirs.sort(key=natural_sort_key)
+        files = [f for f in files if is_playable(f)]
+        files.sort(key=natural_sort_key)
+        
+        options = []
+        if current_path != base_path:
+            options.append(("↩ .. [Go Back]", "__parent__"))
+            
+        for d in dirs:
+            options.append((f"📁 {d}", ("dir", fs_join(current_path, d))))
+            
+        for f in files:
+            options.append((f"📄 {f}", ("file", fs_join(current_path, f))))
+            
+        if not options:
+            options.append(("(Empty Folder)", "__back__"))
+            
+        options.append(("🔄 Force Refresh Folder", "__refresh__"))
+            
+        rel_path = current_path[len(base_path):]
+        if rel_path.startswith('/'): rel_path = rel_path[1:]
+        display_path = f"Root / {rel_path}" if rel_path else "Root"
+        
+        extra_info = [
+            f"Current Folder: {display_path}",
+            f"Location: {current_path}"
+        ]
+        
+        choice = select_menu(stdscr, f"Browse: {course_name}", options, extra_info=extra_info)
+        
+        if choice == '__back__' or choice == '__parent__':
+            if current_path == base_path:
+                return
+            else:
+                current_path = fs_dirname(current_path)
+        elif choice == '__refresh__':
+            try:
+                fs_listdir(current_path, force_refresh=True)
+            except Exception:
+                pass
+        elif choice:
+            type_, path = choice
+            if type_ == "dir":
+                current_path = path
+            elif type_ == "file":
+                play_file(stdscr, path, course_name, config)
+
+def add_course_screen(stdscr, config):
+    curses.endwin()
+    print("\n=== Add a New Course ===")
+    try:
+        name = input("Enter course name: ").strip()
+        if not name:
+            print("Course name cannot be empty.")
+            time.sleep(1.5)
+            return
+            
+        path = input("Enter absolute local path OR rclone remote (e.g. drive:Folder): ").strip()
+        if not is_rclone_path(path):
+            path = os.path.abspath(os.path.expanduser(path))
+            if not os.path.exists(path) or not os.path.isdir(path):
+                print(f"Local directory does not exist: {path}")
+                time.sleep(2)
+                return
+        else:
+            try:
+                subprocess.run(["rclone", "lsjson", path], check=True, capture_output=True)
+            except Exception:
+                print(f"Failed to access rclone remote path: {path}")
+                time.sleep(2)
+                return
+            
+        for course in config["courses"]:
+            if course["name"].lower() == name.lower() or course["path"] == path:
+                print("Course name or path already registered.")
+                time.sleep(2)
+                return
+                
+        config["courses"].append({
+            "name": name,
+            "path": path,
+            "last_played": None
+        })
+        save_config(config)
+        print(f"Successfully added course '{name}'!")
+        time.sleep(1.5)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        time.sleep(1)
+    finally:
+        stdscr.clear()
+        stdscr.refresh()
+
+def handle_course_options(stdscr, course, config):
+    course_name = course["name"]
+    base_path = course["path"]
+    if not is_rclone_path(base_path):
+        base_path = os.path.abspath(os.path.expanduser(base_path))
+    
+    while True:
+        stdscr.clear()
+        stdscr.addstr(2, 2, f"Loading course data... Please wait.", curses.color_pair(3))
+        stdscr.refresh()
+        
+        fresh_course = next((c for c in config["courses"] if c["name"] == course_name), None)
+        if not fresh_course:
+            return
+            
+        last_played = fresh_course.get("last_played")
+        next_files = get_next_files(last_played["file_path"]) if last_played else {}
+        next_video = next_files.get("video")
+        next_doc = next_files.get("doc")
+        
+        options = []
+        extra_info = [f"Path: {base_path}"]
+        
+        if last_played:
+            extra_info.append(f"Last watched: {last_played['file_name']}")
+            options.append(("▶ Resume Session", ("resume", last_played["file_path"])))
+            
+        if next_video:
+            options.append((f"⏭ Play Next Video: {fs_basename(next_video)}", ("play", next_video)))
+            
+        if next_doc:
+            options.append((f"📄 Next Document: {fs_basename(next_doc)}", ("play", next_doc)))
+            
+        options.append(("📁 Browse Folders", ("browse", base_path)))
+        options.append(("↩ Back to Courses", "__back__"))
+        
+        choice = select_menu(stdscr, f"Course: {course_name}", options, extra_info=extra_info)
+        
+        if choice == '__back__':
+            return
+        elif choice:
+            action_type, path = choice
+            if action_type == "resume" or action_type == "play":
+                play_file(stdscr, path, course_name, config)
+            elif action_type == "browse":
+                browse_folders(stdscr, base_path, path, course_name, config)
+
+def main(stdscr):
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(6, curses.COLOR_WHITE, -1)
+
+    curses.curs_set(0)
+    
+    while True:
+        config = load_config()
+        
+        options = []
+        for course in config["courses"]:
+            options.append((course["name"], ("course", course)))
+            
+        options.append(("[+] Add a New Course", ("action", "add")))
+        options.append(("[x] Exit", ("action", "exit")))
+        
+        choice = select_menu(stdscr, "COURSES MANAGER", options)
+        
+        if choice == '__back__' or choice == ('action', 'exit'):
+            break
+        elif choice == ('action', 'add'):
+            add_course_screen(stdscr, config)
+        elif choice:
+            _, course = choice
+            handle_course_options(stdscr, course, config)
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except Exception as e:
+        print(f"Fatal error: {e}")
